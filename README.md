@@ -59,7 +59,7 @@ pasted again, which blunts answer-sharing across wallets.
 | AI grading | `gl.nondet.web.render` fetches the article; `gl.nondet.exec_prompt` inside a closure, reconciled across validators via `gl.eq_principle.prompt_comparative` |
 | Output safety | Grader output is validated (JSON parse, structure, field presence, type, and domain of the `verdict` field) before any state mutation or fund transfer |
 | Prompt-injection hardening | The reader's answer is passed to the grader explicitly labeled as untrusted data to be graded, never instructions |
-| Copy detection | Each graded answer is embedded (`all-MiniLM-L6-v2`, 384-dim) and stored in a `VecDB`; a nearest-neighbour distance under `COPY_DISTANCE_THRESHOLD = 0.05` within the same campaign triggers `REJECTED_COPY`, checked before any attempt is consumed |
+| Copy detection | Each graded answer is embedded (`all-MiniLM-L6-v2`, 384-dim) and stored in a `VecDB`, with a `registry_size` counter tracking how many records it holds. Before grading, the new answer is searched against **the entire registry** (`knn(embedding, registry_size)`) and the results are then filtered to the current campaign, so every prior answer for that campaign is always checked and answers from other campaigns can never crowd one out. A match under `COPY_DISTANCE_THRESHOLD = 0.05` within the same campaign triggers `REJECTED_COPY`, checked before any attempt is consumed |
 | Payout | Fixed `reward_per_reader` per correct wallet, pure `u256` integer arithmetic, one reward per wallet per campaign |
 | Fund safety | Funds only move on a `CORRECT` verdict (the fixed reward), `close_campaign` (sponsor, unspent budget only) or `claim_expired_refund` (deadline passed, unspent budget only). Unspent budget is always `budget - reward * readers_rewarded`, so paid-out funds can never be refunded a second time |
 
@@ -94,6 +94,8 @@ parameters are used anywhere.
 - **`get_my_status(campaign_id: str, address: str) -> dict`**
   A given address's attempts used, attempts left and rewarded flag.
 - **`get_campaign_count() -> int`**
+- **`get_answer_registry_size() -> int`**
+  Total number of graded answers stored in the copy-detection registry.
 
 ## Tested end-to-end in GenLayer Studio
 
@@ -114,6 +116,36 @@ parameters are used anywhere.
   `get_campaign` confirmed `status: "CLOSED"`, `readers_rewarded: "1"`,
   `unspent_budget: "500000000000000000"` (the amount that was unspent at
   the moment of closing).
+
+### Fix round (steward-requested, Oct 2026)
+
+A steward review flagged a gap in the copy check before accepting the
+contract, fixed and retested:
+
+- **Copy search is now exhaustive for the campaign.** The original check
+  asked the vector store for only the 10 nearest records across *all*
+  campaigns and filtered by campaign afterward. If 10 or more closer matches
+  came from other campaigns, a prior answer for the current campaign could be
+  pushed out of those 10, letting a copied answer through to grading and
+  payment. Fixed by tracking a `registry_size` counter and searching the whole
+  registry (`knn(embedding, registry_size)`), then filtering by campaign, so
+  every relevant prior answer is always examined. The fixed `COPY_SEARCH_DEPTH`
+  constant was removed, and a `get_answer_registry_size` view was added.
+
+Verified in Studio on a fresh deployment with two campaigns:
+- A wrong answer submitted to campaign `R0` was graded `INCORRECT`.
+- The identical answer submitted to a second campaign, `R1`, was graded
+  `INCORRECT` as well and was **not** rejected as a copy, confirming that
+  answers from other campaigns do not count against it.
+- Resubmitting the identical answer to `R0` was correctly rejected as
+  **`REJECTED_COPY`**, even though `R1` now held an identical record, and
+  without using up an attempt.
+- A genuinely correct answer in `R0` was graded `CORRECT` and paid
+  `"500000000000000000 wei"`.
+- `get_answer_registry_size` returned `3`: the `R0` wrong answer, the `R1`
+  wrong answer and the `R0` correct answer. The rejected copy is not stored.
+- All test transactions reached `FINALIZED`/`SUCCESS` with validator
+  agreement.
 
 ## Deployment
 
@@ -153,8 +185,16 @@ GenLayer Studio or via `genlayer-js` against Studionet / Bradbury testnet.
 - Copy detection is deliberately tight (distance under 0.05): independent
   readers who give correct answers in different words will both pass. It
   blocks near-verbatim recycling of a known answer, not sybil wallets in
-  general, and it is scoped per campaign so unrelated campaigns never
-  interfere with each other.
+  general.
+- Copy detection is scoped per campaign by searching the full registry and
+  filtering by campaign, rather than by taking a fixed number of nearest
+  records. A fixed cutoff would be unsafe, because enough close matches from
+  other campaigns could push a prior answer for the current campaign out of
+  the results and let a copy through to grading and payment. The trade-off is
+  that each submission's search cost grows with the total number of graded
+  answers stored across all campaigns, which is acceptable at this contract's
+  scale. A per-campaign index would be the next step for a much larger
+  deployment.
 - A rejected copy costs the reader nothing, since it consumes no attempt,
   while every graded answer (correct or not) is added to the registry.
 
