@@ -15,7 +15,6 @@ COPY_DISTANCE_THRESHOLD = 0.05
 MAX_ATTEMPTS = 2
 MIN_ANSWER_LENGTH = 40
 MAX_READERS_LIMIT = 100
-COPY_SEARCH_DEPTH = 10
 
 @gl.evm.contract_interface
 class _Recipient:
@@ -32,6 +31,7 @@ class AnswerRecord:
 
 class ProofOfRead(gl.Contract):
     campaign_counter: u256
+    registry_size: u256
 
     sponsor_map: TreeMap[str, Address]
     article_url_map: TreeMap[str, str]
@@ -50,6 +50,7 @@ class ProofOfRead(gl.Contract):
 
     def __init__(self):
         self.campaign_counter = u256(0)
+        self.registry_size = u256(0)
 
     def get_embedding_generator(self):
         return gle.SentenceTransformer("all-MiniLM-L6-v2")
@@ -109,10 +110,12 @@ class ProofOfRead(gl.Contract):
         assert used < u256(MAX_ATTEMPTS), "No attempts left for this campaign"
 
         embedding = self.get_embedding(answer)
-        nearest = list(self.answer_registry.knn(embedding, COPY_SEARCH_DEPTH))
-        for match in nearest:
-            if match.value.campaign_id == campaign_id and match.distance < COPY_DISTANCE_THRESHOLD:
-                return "REJECTED_COPY - this answer is too similar to one already submitted for this campaign; write it in your own words (this did not use up an attempt)"
+        registry_total = int(self.registry_size)
+        if registry_total > 0:
+            nearest = list(self.answer_registry.knn(embedding, registry_total))
+            for match in nearest:
+                if match.value.campaign_id == campaign_id and match.distance < COPY_DISTANCE_THRESHOLD:
+                    return "REJECTED_COPY - this answer is too similar to one already submitted for this campaign; write it in your own words (this did not use up an attempt)"
 
         self.attempts_map[reader_key] = used + u256(1)
 
@@ -163,6 +166,7 @@ or
         assert isinstance(reasoning, str), "Grader 'reasoning' field was not a string; refusing to grade this answer."
 
         self.answer_registry.insert(embedding, AnswerRecord(campaign_id=campaign_id, verdict=verdict))
+        self.registry_size += u256(1)
 
         if verdict == "INCORRECT":
             return f"INCORRECT - {reasoning}"
@@ -230,3 +234,7 @@ or
     @gl.public.view
     def get_campaign_count(self) -> int:
         return int(self.campaign_counter)
+
+    @gl.public.view
+    def get_answer_registry_size(self) -> int:
+        return int(self.registry_size)
